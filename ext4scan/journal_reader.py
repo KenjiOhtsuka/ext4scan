@@ -64,8 +64,67 @@ class JournalReader:
         self.inode_table_block = struct.unpack_from("<I", gd, 8)[0]
         log_debug(f"Inode table block: {self.inode_table_block}")
 
+    def _parse_extent_leaf(self, inode, entries):
+        """Parse ext4_extent structures in a leaf node."""
+        self.journal_blocks = []
+
+        # extents start at offset 40 + 12 = 52
+        offset = 40 + 12
+
+        for i in range(entries):
+            ee_block, ee_len, ee_start_hi, ee_start_lo = struct.unpack_from(
+                "<IHHI", inode, offset + i * 12
+            )
+
+            phys = (ee_start_hi << 32) | ee_start_lo
+
+            log_debug(f"Extent: logical={ee_block}, len={ee_len}, phys={phys}")
+
+            # Add each physical block in the extent
+            for b in range(ee_len):
+                self.journal_blocks.append(phys + b)
+
+    def _parse_extent_internal(self, inode, depth):
+        """Parse internal extent nodes (rare for journal inode)."""
+
+        # internal nodes contain ext4_extent_idx entries
+        # struct ext4_extent_idx {
+        #   __le32 ei_block;
+        #   __le32 ei_leaf_lo;
+        #   __le16 ei_leaf_hi;
+        #   __le16 ei_unused;
+        # }
+
+        offset = 40 + 12
+        entries = struct.unpack_from("<H", inode, 42)[0]
+
+        for i in range(entries):
+            ei_block, ei_leaf_lo, ei_leaf_hi, _ = struct.unpack_from(
+                "<IIHH", inode, offset + i * 12
+            )
+
+            leaf_phys = (ei_leaf_hi << 32) | ei_leaf_lo
+            leaf_offset = leaf_phys * self.block_size
+
+            log_debug(f"Internal extent node → leaf at block {leaf_phys}")
+
+            # Read the leaf block and parse it as a leaf node
+            leaf = self.read_range(leaf_offset, self.block_size)
+
+            # Parse leaf extent header
+            eh_magic, eh_entries, eh_max, eh_depth, eh_generation = struct.unpack_from(
+                "<HHHHI", leaf, 0
+            )
+
+            if eh_magic != 0xF30A:
+                raise ValueError("Invalid extent header in leaf node.")
+
+            self._parse_extent_leaf(leaf, eh_entries)
+
+
     def _read_journal_inode(self):
-        """Read the journal inode to get i_block[]"""
+        """Read the journal inode and extract journal block ranges via extents."""
+
         inode_size = 256  # ext4 default
         inode_index = self.journal_inode - 1
 
@@ -76,10 +135,26 @@ class JournalReader:
 
         inode = self.read_range(inode_offset, inode_size)
 
-        # i_block[] = 15 * 4 bytes = 60 bytes
-        self.i_block = struct.unpack_from("<15I", inode, 40)
+        # ---- Parse extent header ----
+        # i_block starts at offset 40
+        eh_magic, eh_entries, eh_max, eh_depth, eh_generation = struct.unpack_from(
+            "<HHHHI", inode, 40
+        )
 
-        log_debug(f"i_block[]: {self.i_block}")
+        if eh_magic != 0xF30A:
+            raise ValueError("Invalid extent header magic. Not an ext4 extent inode.")
+
+        log_debug(f"Extent header: entries={eh_entries}, depth={eh_depth}")
+
+        # ---- Case 1: extent tree depth = 0 (leaf node) ----
+        if eh_depth == 0:
+            self._parse_extent_leaf(inode, eh_entries)
+            return
+
+        # ---- Case 2: depth > 0 (internal nodes) ----
+        # For journal inode, depth is usually 0, but handle general case
+        self._parse_extent_internal(inode, eh_depth)
+
 
     def _collect_journal_blocks(self):
         """Collect journal block numbers from i_block[]"""
