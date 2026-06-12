@@ -51,32 +51,47 @@ class JournalReader:
     def _read_superblock(self):
         log_debug("Reading ext4 superblock...")
 
-        buf = bytearray(64)
-        fcntl.ioctl(self.fd.fileno(), BLKGETPARTINFO, buf)
-        start_sector = struct.unpack_from("<Q", buf, 0)[0]
-        self.partition_offset = start_sector * 512
-        
-        PARTITION_OFFSET = 1048576  # 1MiB
+        # ext4 superblock signature
+        EXT4_SUPER_MAGIC = 0xEF53
 
-        sb = self.read_range(PARTITION_OFFSET + 1024, 1024)
+        # ext4 superblock は FS 先頭 + 1024 にある
+        # しかしパーティションの先頭が不明なので、スキャンする
+        possible_offsets = [
+            1024,               # パーティション先頭 = デバイス先頭の場合
+            1048576 + 1024,     # 1MiB アライメントの一般的なケース
+            2048 * 512 + 1024,  # 1MiB = 2048 セクタ
+        ]
 
-        # sb = self.read_range(EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE)
+        sb = None
+        for off in possible_offsets:
+            data = self.read_range(off, 1024)
+            magic = struct.unpack_from("<H", data, 0x38)[0]
+            if magic == EXT4_SUPER_MAGIC:
+                log_debug(f"Found ext4 superblock at offset {off}")
+                sb = data
+                self.partition_offset = off - 1024
+                break
 
+        if sb is None:
+            raise RuntimeError("Could not locate ext4 superblock.")
+
+        # ---- ここから先は今まで通り ----
         log_block_size = struct.unpack_from("<I", sb, 0x18)[0]
         self.block_size = 1024 << log_block_size
         self.blocks_per_group = struct.unpack_from("<I", sb, 0x20)[0]
         self.log_groups_per_flex = struct.unpack_from("<B", sb, 0x7C)[0]
         self.groups_per_flex = 1 << self.log_groups_per_flex
-        
+
         self.inodes_per_group = struct.unpack_from("<I", sb, 0x28)[0]
         log_debug(f"Inodes per group: {self.inodes_per_group}")
 
         self.journal_inode = struct.unpack_from("<I", sb, 0x38)[0]
         self.inode_size = struct.unpack_from("<H", sb, 0x58)[0]
-        
+
         self.gd_size = struct.unpack_from("<H", sb, 0xFE)[0]
         if self.gd_size == 0:
             self.gd_size = 32
+
         log_debug(f"Group desc size: {self.gd_size}")
         log_debug(f"Block size: {self.block_size}")
         log_debug(f"Journal inode: {self.journal_inode}")
