@@ -8,7 +8,7 @@ from .logger import log_debug
 EXT4_SUPERBLOCK_OFFSET = 1024
 EXT4_SUPERBLOCK_SIZE = 1024
 BLKGETSIZE64 = 0x80081272
-
+BLKGETPARTINFO = 0x80081263
 
 class JournalReader:
     """
@@ -51,7 +51,16 @@ class JournalReader:
     def _read_superblock(self):
         log_debug("Reading ext4 superblock...")
 
-        sb = self.read_range(EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE)
+        buf = bytearray(64)
+        fcntl.ioctl(self.fd.fileno(), BLKGETPARTINFO, buf)
+        start_sector = struct.unpack_from("<Q", buf, 0)[0]
+        self.partition_offset = start_sector * 512
+        
+        PARTITION_OFFSET = 1048576  # 1MiB
+
+        sb = self.read_range(PARTITION_OFFSET + 1024, 1024)
+
+        # sb = self.read_range(EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE)
 
         log_block_size = struct.unpack_from("<I", sb, 0x18)[0]
         self.block_size = 1024 << log_block_size
