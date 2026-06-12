@@ -10,7 +10,7 @@ def main():
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     # print(args.device)
-    reader = JournalReader(args.device)
+    reader = JournalReader(args.device, debug=args.debug)
     parser = JBD2Parser()
     timeline = Timeline()
 

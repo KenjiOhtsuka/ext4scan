@@ -49,7 +49,7 @@ class JournalReader:
         log_block_size = struct.unpack_from("<I", sb, 0x18)[0]
         self.block_size = 1024 << log_block_size
 
-        self.journal_inode = struct.unpack_from("<I", sb, 0x38)[0]
+        self.journal_inode = struct.unpack_from("<I", sb, 0xE0)[0]
 
         log_debug(f"Block size: {self.block_size}")
         log_debug(f"Journal inode: {self.journal_inode}")
@@ -58,7 +58,10 @@ class JournalReader:
         """
         Read group descriptor 0 to locate inode table.
         """
-        gd_offset = self.block_size * 2
+        if self.block_size == 1024:
+            gd_offset = self.block_size * 2
+        else:
+            gd_offset = self.block_size
         gd = self.read_range(gd_offset, 32)
 
         self.inode_table_block = struct.unpack_from("<I", gd, 8)[0]
@@ -125,7 +128,7 @@ class JournalReader:
     def _read_journal_inode(self):
         """Read the journal inode and extract journal block ranges via extents."""
 
-        inode_size = 256  # ext4 default
+        inode_size = struct.unpack_from("<H", sb, 0x58)[0]
         inode_index = self.journal_inode - 1
 
         inode_offset = (
