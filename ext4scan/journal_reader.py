@@ -85,7 +85,18 @@ class JournalReader:
         self.inodes_per_group = struct.unpack_from("<I", sb, 0x28)[0]
         log_debug(f"Inodes per group: {self.inodes_per_group}")
 
-        self.journal_inode = struct.unpack_from("<I", sb, 0x38)[0]
+        ji = None
+        for off in range(0x40, 1024, 4):
+            val = struct.unpack_from("<I", sb, off)[0]
+            if val == 8:  # dumpe2fs が教えてくれた journal inode
+                ji = val
+                log_debug(f"Found journal inode field at offset 0x{off:02x}")
+                break
+
+        if ji is None:
+            raise RuntimeError("Could not locate journal inode in superblock.")
+
+        self.journal_inode = ji
         self.inode_size = struct.unpack_from("<H", sb, 0x58)[0]
 
         self.gd_size = struct.unpack_from("<H", sb, 0xFE)[0]
@@ -95,6 +106,7 @@ class JournalReader:
         log_debug(f"Group desc size: {self.gd_size}")
         log_debug(f"Block size: {self.block_size}")
         log_debug(f"Journal inode: {self.journal_inode}")
+
 
     def _locate_journal_inode(self):
         """
@@ -114,37 +126,42 @@ class JournalReader:
         log_debug(f"GD offset: {gd_offset}")
         # log_debug(f"inode_table_lo={inode_table_lo}")
         log_debug(f"Inode table block: {self.inode_table_block}")
-        
+    
 
-    def _parse_extent_leaf(self, inode, entries):
-        """Parse ext4_extent structures in a leaf node."""
-        # extents start at offset 40 + 12 = 52
-        offset = 40 + 12
-
+    def _parse_extent_leaf_inline(self, inode, entries):
+        """i_block 内に inline されている leaf extents を読む"""
+        base = 40 + 12  # inode 内の i_block の先頭(40) + header(12)
         for i in range(entries):
             ee_block, ee_len, ee_start_hi, ee_start_lo = struct.unpack_from(
-                "<IHHI", inode, offset + i * 12
+                "<IHHI", inode, base + i * 12
             )
-
+            if ee_len == 0:
+                continue
             phys = (ee_start_hi << 32) | ee_start_lo
-
-            log_debug(f"Extent: logical={ee_block}, len={ee_len}, phys={phys}")
-
-            # Add each physical block in the extent
+            log_debug(f"Extent(inline): logical={ee_block}, len={ee_len}, phys={phys}")
             for b in range(ee_len):
                 self.journal_blocks.append(phys + b)
+
+
+    def _parse_extent_leaf_block(self, leaf, entries):
+        """別ブロックとして存在する leaf ノードを読む"""
+        base = 12  # header が 0〜11, その直後から extents
+        for i in range(entries):
+            ee_block, ee_len, ee_start_hi, ee_start_lo = struct.unpack_from(
+                "<IHHI", leaf, base + i * 12
+            )
+            if ee_len == 0:
+                continue
+            phys = (ee_start_hi << 32) | ee_start_lo
+            log_debug(f"Extent(leaf): logical={ee_block}, len={ee_len}, phys={phys}")
+            for b in range(ee_len):
+                self.journal_blocks.append(phys + b)
+
 
     def _parse_extent_internal(self, inode, depth):
         """Parse internal extent nodes (rare for journal inode)."""
 
         # internal nodes contain ext4_extent_idx entries
-        # struct ext4_extent_idx {
-        #   __le32 ei_block;
-        #   __le32 ei_leaf_lo;
-        #   __le16 ei_leaf_hi;
-        #   __le16 ei_unused;
-        # }
-
         offset = 40 + 12
         entries = struct.unpack_from("<H", inode, 42)[0]
 
@@ -154,7 +171,7 @@ class JournalReader:
             )
 
             leaf_phys = (ei_leaf_hi << 32) | ei_leaf_lo
-            leaf_offset = leaf_phys * self.block_size
+            leaf_offset = self.partition_offset + leaf_phys * self.block_size
 
             log_debug(f"Internal extent node → leaf at block {leaf_phys}")
 
@@ -169,17 +186,20 @@ class JournalReader:
             if eh_magic != 0xF30A:
                 raise ValueError("Invalid extent header in leaf node.")
 
-            self._parse_extent_leaf(leaf, eh_entries)
+            # leaf ブロック用のパーサを使う
+            self._parse_extent_leaf_block(leaf, eh_entries)
 
     def _get_inode_table_block(self, group: int) -> int:
         flex_group = group // self.groups_per_flex
         first_gd_block = 1  # block_size > 1024 の場合
 
         gd_offset = (
+            self.partition_offset +
             first_gd_block * self.block_size
             + flex_group * self.groups_per_flex * self.gd_size
             + (group % self.groups_per_flex) * self.gd_size
         )
+
 
         gd = self.read_range(gd_offset, self.gd_size)
 
@@ -204,7 +224,8 @@ class JournalReader:
         inode_table_block = self._get_inode_table_block(group)
 
         inode_offset = (
-            inode_table_block * self.block_size
+            (inode_table_block * self.block_size)
+            + self.partition_offset
             + index * self.inode_size
         )
 
@@ -212,7 +233,6 @@ class JournalReader:
         log_debug(f"inode_offset={inode_offset}")
 
         # ここで必ず inode_offset を使って inode を読む
-        inode = self.read_range(inode_offset, self.inode_size)
         inode = self.read_range(inode_offset, self.inode_size)
 
         # i_mode が 0 なら「未使用 inode」
@@ -263,21 +283,19 @@ class JournalReader:
 
         log_debug(f"Extent header: entries={eh_entries}, depth={eh_depth}")
 
-        # ---- Case 1: extent tree depth = 0 (leaf node) ----
         if eh_depth == 0:
-            self._parse_extent_leaf(inode, eh_entries)
+            self._parse_extent_leaf_inline(inode, eh_entries)
             return
 
-        # ---- Case 2: depth > 0 (internal nodes) ----
         self._parse_extent_internal(inode, eh_depth)
 
 
     def read_journal_blocks(self):
         """Yield only journal blocks"""
-        for block in self.journal_blocks:
-            offset = block * self.block_size
-            data = self.read_range(offset, self.block_size)
 
+        for block in self.journal_blocks:
+            offset = self.partition_offset + block * self.block_size
+            data = self.read_range(offset, self.block_size)
             yield {
                 "block_number": block,
                 "raw": data,
