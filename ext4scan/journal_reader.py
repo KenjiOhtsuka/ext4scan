@@ -19,7 +19,11 @@ class JournalReader:
     - journal block range
     """
 
-    def __init__(self, device_path: str):
+    def __init__(self, device_path: str, debug=False):
+        if debug:
+            from .logger import enable_debug
+            enable_debug()
+
         self.device_path = Path(device_path)
         self.fd = None
         self.block_size = None
@@ -27,10 +31,13 @@ class JournalReader:
         self.journal_blocks = []
 
         self._open()
+        log_debug("Opened")
         self._read_superblock()
-        self._locate_journal_inode()
+        log_debug("Read super block")
+        # self._locate_journal_inode()
+        # log_debug("Inode located")
         self._read_journal_inode()
-        self._collect_journal_blocks()
+        log_debug("Inode read")
 
     def _open(self):
         log_debug(f"Opening device/image: {self.device_path}")
@@ -48,9 +55,20 @@ class JournalReader:
 
         log_block_size = struct.unpack_from("<I", sb, 0x18)[0]
         self.block_size = 1024 << log_block_size
+        self.blocks_per_group = struct.unpack_from("<I", sb, 0x20)[0]
+        self.log_groups_per_flex = struct.unpack_from("<B", sb, 0x7C)[0]
+        self.groups_per_flex = 1 << self.log_groups_per_flex
+        
+        self.inodes_per_group = struct.unpack_from("<I", sb, 0x28)[0]
+        log_debug(f"Inodes per group: {self.inodes_per_group}")
 
-        self.journal_inode = struct.unpack_from("<I", sb, 0xE0)[0]
-
+        self.journal_inode = struct.unpack_from("<I", sb, 0x38)[0]
+        self.inode_size = struct.unpack_from("<H", sb, 0x58)[0]
+        
+        self.gd_size = struct.unpack_from("<H", sb, 0xFE)[0]
+        if self.gd_size == 0:
+            self.gd_size = 32
+        log_debug(f"Group desc size: {self.gd_size}")
         log_debug(f"Block size: {self.block_size}")
         log_debug(f"Journal inode: {self.journal_inode}")
 
@@ -62,15 +80,20 @@ class JournalReader:
             gd_offset = self.block_size * 2
         else:
             gd_offset = self.block_size
-        gd = self.read_range(gd_offset, 32)
 
-        self.inode_table_block = struct.unpack_from("<I", gd, 8)[0]
+        gd = self.read_range(gd_offset, self.gd_size)
+
+        # # まずは下位32bitだけを使う（多くの環境でこれで十分）
+        # inode_table_lo = struct.unpack_from("<I", gd, 8)[0]
+        # self.inode_table_block = inode_table_lo
+
+        log_debug(f"GD offset: {gd_offset}")
+        # log_debug(f"inode_table_lo={inode_table_lo}")
         log_debug(f"Inode table block: {self.inode_table_block}")
+        
 
     def _parse_extent_leaf(self, inode, entries):
         """Parse ext4_extent structures in a leaf node."""
-        self.journal_blocks = []
-
         # extents start at offset 40 + 12 = 52
         offset = 40 + 12
 
@@ -124,29 +147,59 @@ class JournalReader:
 
             self._parse_extent_leaf(leaf, eh_entries)
 
+    def _get_inode_table_block(self, group: int) -> int:
+        flex_group = group // self.groups_per_flex
+        first_gd_block = 1  # block_size > 1024 の場合
 
-    def _read_journal_inode(self):
-        """Read the journal inode and extract journal block ranges via extents."""
-
-        inode_size = struct.unpack_from("<H", sb, 0x58)[0]
-        inode_index = self.journal_inode - 1
-
-        inode_offset = (
-            self.inode_table_block * self.block_size
-            + inode_index * inode_size
+        gd_offset = (
+            first_gd_block * self.block_size
+            + flex_group * self.groups_per_flex * self.gd_size
+            + (group % self.groups_per_flex) * self.gd_size
         )
 
-        inode = self.read_range(inode_offset, inode_size)
+        gd = self.read_range(gd_offset, self.gd_size)
 
-        # ---- Parse extent header ----
-        # i_block starts at offset 40
+        inode_table_lo = struct.unpack_from("<I", gd, 8)[0]
+        inode_table_hi = 0
+        if self.gd_size >= 64:
+            inode_table_hi = struct.unpack_from("<I", gd, 0x28)[0]
+
+        inode_table_block = inode_table_lo | (inode_table_hi << 32)
+
+        log_debug(f"Group {group}: flex_group={flex_group}, GD offset={gd_offset}, inode_table_block={inode_table_block}")
+        return inode_table_block
+
+    def _read_journal_inode(self):
+
+
+        self.journal_blocks = []
+
+        inode_num = self.journal_inode
+        group = (inode_num - 1) // self.inodes_per_group
+        index = (inode_num - 1) % self.inodes_per_group
+
+        inode_table_block = self._get_inode_table_block(group)
+
+        inode_offset = (
+            inode_table_block * self.block_size
+            + index * self.inode_size
+        )
+
+        log_debug(f"inode_num={inode_num}, group={group}, index={index}")
+        log_debug(f"inode_offset={inode_offset}")
+
+
+
+        inode = self.read_range(inode_offset, self.inode_size)
+
         eh_magic, eh_entries, eh_max, eh_depth, eh_generation = struct.unpack_from(
             "<HHHHI", inode, 40
         )
-
+        log_debug(f"eh_magic=0x{eh_magic:04x}, entries={eh_entries}, depth={eh_depth}")
+        
         if eh_magic != 0xF30A:
             raise ValueError("Invalid extent header magic. Not an ext4 extent inode.")
-
+        
         log_debug(f"Extent header: entries={eh_entries}, depth={eh_depth}")
 
         # ---- Case 1: extent tree depth = 0 (leaf node) ----
@@ -158,14 +211,6 @@ class JournalReader:
         # For journal inode, depth is usually 0, but handle general case
         self._parse_extent_internal(inode, eh_depth)
 
-
-    def _collect_journal_blocks(self):
-        """Collect journal block numbers from i_block[]"""
-        for block in self.i_block:
-            if block != 0:
-                self.journal_blocks.append(block)
-
-        log_debug(f"Journal blocks: {self.journal_blocks}")
 
     def read_journal_blocks(self):
         """Yield only journal blocks"""
