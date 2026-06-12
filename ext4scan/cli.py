@@ -11,6 +11,12 @@ def main():
     args = parser.parse_args()
     # print(args.device)
     reader = JournalReader(args.device, debug=args.debug)
+    if not reader.journal_blocks:
+        print("No internal ext4 journal found. Timeline will be empty.")
+        # timeline.json を空で作るならここで return してもよい
+        Timeline().save(args.output)
+        return
+
     parser = JBD2Parser()
     timeline = Timeline()
 

@@ -170,8 +170,7 @@ class JournalReader:
         return inode_table_block
 
     def _read_journal_inode(self):
-
-
+        """Read the journal inode and extract journal block ranges via extents."""
         self.journal_blocks = []
 
         inode_num = self.journal_inode
@@ -188,18 +187,56 @@ class JournalReader:
         log_debug(f"inode_num={inode_num}, group={group}, index={index}")
         log_debug(f"inode_offset={inode_offset}")
 
-
-
+        # ここで必ず inode_offset を使って inode を読む
+        inode = self.read_range(inode_offset, self.inode_size)
         inode = self.read_range(inode_offset, self.inode_size)
 
+        # i_mode が 0 なら「未使用 inode」
+        i_mode = struct.unpack_from("<H", inode, 0x0)[0]
+        i_blocks = struct.unpack_from("<I", inode, 0x1C)[0]
+
+        if i_mode == 0 or i_blocks == 0:
+            log_debug("Journal inode is unused or has no blocks (no internal journal).")
+            self.journal_blocks = []
+            return
+
+        # ---- i_flags を確認して extents かどうか判定 ----
+        i_flags = struct.unpack_from("<I", inode, 0x20)[0]
+        log_debug(f"i_flags=0x{i_flags:08x}")
+
+        EXT4_EXTENTS_FL = 0x00080000
+
+        # ---- Non-extents (legacy block map) ----
+        if not (i_flags & EXT4_EXTENTS_FL):
+            log_debug("Journal inode uses legacy block map (not extents).")
+
+            # i_block は offset 40 から 60 bytes
+            blocks = struct.unpack_from("<15I", inode, 40)
+            log_debug(f"i_block entries: {blocks}")
+
+            # 直接ブロック 0〜11 を読む
+            for b in blocks[:12]:
+                if b != 0:
+                    self.journal_blocks.append(b)
+
+            # 1段間接ブロック（必要なら後で実装）
+            indirect = blocks[12]
+            if indirect != 0:
+                log_debug(f"Indirect block at {indirect} (not yet implemented)")
+                # TODO: implement reading indirect block
+
+            return
+
+        # ---- Parse extent header ----
+        # i_block starts at offset 40
         eh_magic, eh_entries, eh_max, eh_depth, eh_generation = struct.unpack_from(
             "<HHHHI", inode, 40
         )
         log_debug(f"eh_magic=0x{eh_magic:04x}, entries={eh_entries}, depth={eh_depth}")
-        
+
         if eh_magic != 0xF30A:
             raise ValueError("Invalid extent header magic. Not an ext4 extent inode.")
-        
+
         log_debug(f"Extent header: entries={eh_entries}, depth={eh_depth}")
 
         # ---- Case 1: extent tree depth = 0 (leaf node) ----
@@ -208,7 +245,6 @@ class JournalReader:
             return
 
         # ---- Case 2: depth > 0 (internal nodes) ----
-        # For journal inode, depth is usually 0, but handle general case
         self._parse_extent_internal(inode, eh_depth)
 
 
@@ -222,6 +258,7 @@ class JournalReader:
                 "block_number": block,
                 "raw": data,
             }
+        log_debug(f"journal_blocks={self.journal_blocks}")
 
     def close(self):
         if self.fd:
